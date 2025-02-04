@@ -129,6 +129,82 @@ class MultimodalTransformer(nn.Module):
             'emotions': emotion_output,
             'sentiments': sentiment_output 
         }
+    
+class MultimodalTrainer:
+    def __init__(self, model, train_loader, val_loader):
+        self.model = model
+        self.train_loader = train_loader
+        self.val_loader = val_loader
+
+        train_size = len(train_loader.dataset)
+        val_size = len(val_loader.dataset)
+        print("\nDataset Sizes:")
+        print(f"Training samples: {train_size}")
+        print(f"Validation samples: {val_size}")
+        print(f"Batches per epoch: {len(train_loader):,}")
+
+        self.optimzer = torch.optim.Adam(
+            [
+                {'params': model.text_encoder.parameters(), 'lr': 8e-6},
+                {'params': model.video_encoder.parameters(), 'lr': 8e-5},
+                {'params': model.audio_encoder.parameters(), 'lr': 8e-5},
+                {'params': model.fusion_layer.parameters(), 'lr': 5e-4},
+                {'params': model.emotion_classifier.parameters(), 'lr': 5e-4},
+                {'params': model.sentiment_classifier.parameters(), 'lr': 5e-4}
+            ], weight_decay=1e-5
+        )
+
+        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimzer,
+            mode='min',
+            factor=0.1,
+            patience=2,
+        )
+
+        self.emotion_criterion = nn.CrossEntropyLoss(
+            label_smoothing=0.05
+        )
+
+        self.sentiment_criterion = nn.CrossEntropyLoss(
+            label_smoothing=0.05
+        )
+
+    def train_epoch(self):
+        self.model.train()
+        running_loss = {'total': 0, 'emotion': 0, 'sentiment': 0}
+
+        for batch in self.train_loader:
+            device = next(self.model.parameters()).device
+            text_inputs = {
+                'input_ids': batch['text_inputs']['input_ids'].to(device),
+                'attention_mask': batch['text_inputs']['attention_mask'].to(device)
+            }
+            video_frames = batch['video_frames'].to(device)
+            audio_features = batch['audio_features'].to(device)
+            emotion_labels = batch['emotion_label'].to(device)
+            sentiment_labels = batch['sentiment_label'].to(device)
+
+            self.optimzer.zero_grad()
+
+            outputs = self.model(text_inputs, video_frames, audio_features)
+            
+            emotion_loss = self.emotion_criterion(outputs['emotions'], emotion_labels)
+            sentiment_loss = self.sentiment_criterion(outputs['sentiments'], sentiment_labels)
+            total_loss = emotion_loss + sentiment_loss
+
+            total_loss.backward()
+
+            torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(), max_norm=1.0
+            )
+
+            self.optimzer.step()
+
+            running_loss['total'] += total_loss.item()
+            running_loss['emotion'] += emotion_loss.item()
+            running_loss['sentiment'] += sentiment_loss.item()
+    
+        return {k: v/len(self.train_loader) for k, v in running_loss.items()}
 
 if __name__ == "__main__":
     dataset = MELDDataset(
