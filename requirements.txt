@@ -4,3 +4,4 @@ torchvision
 pandas
 transformers
 pandas
+opencv-python
