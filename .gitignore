@@ -3,3 +3,4 @@ dev
 train
 MELD.Raw.tar.gz
 bert-tokenizer
+__pycache__/
