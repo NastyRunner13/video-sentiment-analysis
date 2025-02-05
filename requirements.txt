@@ -5,3 +5,4 @@ pandas
 transformers
 pandas
 opencv-python
+scikit-learn
