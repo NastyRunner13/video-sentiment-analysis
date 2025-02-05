@@ -9,6 +9,11 @@ import torchaudio
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer
 
+import warnings
+# Suppress FutureWarnings and UserWarnings that match specific messages
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
+
 tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
 tokenizer.save_pretrained("./bert-tokenizer")
 
