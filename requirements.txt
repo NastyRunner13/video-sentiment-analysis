@@ -7,3 +7,4 @@ pandas
 opencv-python
 scikit-learn
 opencv-python
+tqdm
