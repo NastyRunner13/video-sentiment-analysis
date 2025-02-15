@@ -1,4 +1,4 @@
-from models import MultimodalTransformer
+from training.models import MultimodalTransformer
 
 
 def count_parameters(model):
