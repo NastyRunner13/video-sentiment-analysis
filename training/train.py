@@ -36,7 +36,7 @@ def main():
     # Install ffmpeg
     if not install_ffmpeg():
         print("Erro: Ffmpeg installation failes. Cannot continue training.")
-        sys.exit()
+        sys.exit(1)
 
     print('Available Audio Backends \n')
     print(str(torchaudio.list_audio_backends())) 
