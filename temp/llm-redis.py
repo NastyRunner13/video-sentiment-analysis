@@ -8,22 +8,25 @@ from typing import Dict, List, Optional, Tuple, Any
 from sentence_transformers import SentenceTransformer, util
 from groq import Groq
 from dotenv import load_dotenv
+from redis.commands.search.field import VectorField, TextField
+from redis.commands.search.indexDefinition import IndexDefinition, IndexType
 load_dotenv()
 
 
 class LLMRedisCache:
     def __init__(
         self, 
-        redis_host: str = 'redis-14799.c80.us-east-1-2.ec2.redns.redis-cloud.com', 
+        redis_host: str = '', 
         redis_port: int = 14799, 
         redis_db: int = 0,
-        redis_username: str ="default",
-        redis_password: str ="ErYgSwTcwPEGElAkEyHvzSjCjg7CLjc1",
+        redis_username: str ="",
+        redis_password: str ="",
         embedding_model: str = 'all-MiniLM-L6-v2',
         groq_api_key: str = None,
         llm_model: str = "llama-3.3-70b-versatile",
         similarity_threshold: float = 0.85,
-        ttl: int = 86400 * 7  # Cache TTL (7 days default)
+        ttl: int = 86400 * 7,  # Cache TTL (7 days default)
+        index_name: str = "llm_embeddings_idx"
     ):
         """
         Initialize Redis connection, embedding model, and Groq API settings.
@@ -37,6 +40,7 @@ class LLMRedisCache:
             similarity_threshold: Threshold for semantic similarity (0-1)
             llm_model: Groq model name to use
             ttl: Time-to-live for cache entries in seconds
+            index_name: Name of the Redis vector search index
         """
         # Initialize Redis clients
         self.redis_client = redis.Redis(
@@ -45,15 +49,7 @@ class LLMRedisCache:
             db=redis_db,
             decode_responses=True,
             username=redis_username,
-            password=redis_password  # For regular keys
-        )
-        self.redis_client_binary = redis.Redis(
-            host=redis_host, 
-            port=redis_port, 
-            db=redis_db,
-            decode_responses=False,
-            username=redis_username,
-            password=redis_password   # For binary data (embeddings)
+            password=redis_password
         )
         
         # Initialize embedding model
@@ -75,8 +71,46 @@ class LLMRedisCache:
         # Key prefixes for different cache types
         self.keyword_prefix = "llm:keyword:"
         self.semantic_prefix = "llm:semantic:"
-        self.embedding_prefix = "llm:embedding:"
+        self.vector_prefix = "llm:vector:"
         self.metadata_prefix = "llm:metadata:"
+        
+        # Vector search index name
+        self.index_name = index_name
+        
+        # Create vector search index if it doesn't exist
+        self._create_vector_index()
+    
+    def _create_vector_index(self):
+        """Create a Redis vector search index for efficient similarity search."""
+        try:
+            # Check if index already exists
+            self.redis_client.ft(self.index_name).info()
+            print(f"Vector index '{self.index_name}' already exists")
+        except:
+            # Create the index
+            schema = [
+                TextField("query"),
+                TextField("response_key"),
+                VectorField(
+                    "embedding", 
+                    "FLAT", 
+                    {
+                        "TYPE": "FLOAT32",
+                        "DIM": self.embedding_dim,
+                        "DISTANCE_METRIC": "COSINE",
+                    }
+                )
+            ]
+            
+            # Create the index with the schema
+            self.redis_client.ft(self.index_name).create_index(
+                schema, 
+                definition=IndexDefinition(
+                    prefix=[self.vector_prefix],
+                    index_type=IndexType.HASH
+                )
+            )
+            print(f"Created vector index '{self.index_name}'")
     
     def get_embedding(self, text: str) -> np.ndarray:
         """
@@ -175,20 +209,34 @@ class LLMRedisCache:
         self.redis_client.set(key, json.dumps(response))
         self.redis_client.expire(key, self.ttl)
         
-        # If embedding is provided, store it separately
+        # If embedding is provided, store it for vector search
         if embedding is not None:
-            embedding_key = f"{self.embedding_prefix}{self._generate_hash(key)}"
-            # Store as binary data
-            self.redis_client_binary.set(embedding_key, embedding.tobytes())
-            self.redis_client_binary.expire(embedding_key, self.ttl)
+            # Generate a hash key for the vector entry
+            hash_key = self._generate_hash(key)
+            vector_key = f"{self.vector_prefix}{hash_key}"
             
-            # Store metadata for this embedding (original query, timestamp, etc.)
+            # Prepare vector data for storage
+            vector_data = {
+                "query": key.replace(self.semantic_prefix, ""),
+                "response_key": key,
+                "embedding": embedding.astype(np.float32).tobytes()
+            }
+            
+            # Store vector data in Redis hash
+            self.redis_client.hset(vector_key, mapping={
+                "query": vector_data["query"],
+                "response_key": vector_data["response_key"],
+                "embedding": vector_data["embedding"]
+            })
+            self.redis_client.expire(vector_key, self.ttl)
+            
+            # Store metadata separately for easier access
             metadata = {
                 "query": key.replace(self.semantic_prefix, ""),
                 "timestamp": time.time(),
                 "response_key": key
             }
-            metadata_key = f"{self.metadata_prefix}{self._generate_hash(key)}"
+            metadata_key = f"{self.metadata_prefix}{hash_key}"
             self.redis_client.set(metadata_key, json.dumps(metadata))
             self.redis_client.expire(metadata_key, self.ttl)
         
@@ -214,55 +262,50 @@ class LLMRedisCache:
     
     def _find_similar_query(self, query_embedding: np.ndarray) -> Optional[Tuple[str, float]]:
         """
-        Find semantically similar query in cache.
+        Find semantically similar query in cache using Redis vector search.
         Returns tuple of (cache_key, similarity_score) if found, None otherwise.
         """
         start_time = time.time()
         
-        # Get all embedding keys
-        all_embedding_keys = self.redis_client_binary.keys(f"{self.embedding_prefix}*")
+        # Prepare the query embedding for Redis vector search
+        query_vector = query_embedding.astype(np.float32).tobytes()
         
-        best_similarity = -1
-        best_key = None
+        # Perform vector search using Redis
+        search_query = f"*=>[KNN 1 @embedding $query_vector AS score]"
+        query_params = {
+            "query_vector": query_vector
+        }
         
-        for emb_key_bytes in all_embedding_keys:
-            # Get the stored embedding
-            stored_embedding_bytes = self.redis_client_binary.get(emb_key_bytes)
-            if not stored_embedding_bytes:
-                continue
+        # Run the search
+        try:
+            results = self.redis_client.ft(self.index_name).search(
+                search_query,
+                query_params=query_params
+            )
+            
+            # Check if we have results
+            if results.total > 0 and hasattr(results, 'docs') and len(results.docs) > 0:
+                # Get the top result
+                top_result = results.docs[0]
+                similarity = 1 - float(top_result.score)  # Convert distance to similarity
                 
-            # Convert bytes back to numpy array
-            stored_embedding = np.frombuffer(stored_embedding_bytes, dtype=np.float32).reshape(self.embedding_dim)
-            
-            # Calculate cosine similarity
-            similarity = util.cos_sim(query_embedding, stored_embedding).item()
-            
-            # Update best match if this one is better
-            if similarity > best_similarity:
-                best_similarity = similarity
-                # Get the original key from metadata
-                # Decode byte keys to strings
-                emb_key = emb_key_bytes.decode('utf-8')
-                hash_key = emb_key.replace(self.embedding_prefix, '')
-                metadata_key = f"{self.metadata_prefix}{hash_key}"
-                metadata = self.redis_client.get(metadata_key)
-                if metadata:
-                    metadata = json.loads(metadata)
-                    best_key = metadata.get("response_key")
+                if similarity >= self.similarity_threshold:
+                    response_key = top_result.response_key
+                    elapsed_time = time.time() - start_time
+                    print(f"Vector search time: {elapsed_time:.4f} seconds")
+                    print(f"Found similar query with similarity: {similarity:.4f}")
+                    return (response_key, similarity)
+        
+        except Exception as e:
+            print(f"Vector search error: {e}")
         
         elapsed_time = time.time() - start_time
-        print(f"Semantic search time: {elapsed_time:.4f} seconds")
-        
-        # Only return if similarity is above threshold
-        if best_similarity >= self.similarity_threshold and best_key:
-            print(f"Found similar query with similarity: {best_similarity:.4f}")
-            return (best_key, best_similarity)
-        
+        print(f"Vector search time: {elapsed_time:.4f} seconds")
         print("No similar queries found above threshold")
         return None
     
     def _get_from_semantic_cache(self, query_embedding: np.ndarray) -> Optional[Dict[str, Any]]:
-        """Try to get response from semantic cache using embedding similarity."""
+        """Try to get response from semantic cache using vector search."""
         similar_query = self._find_similar_query(query_embedding)
         
         if similar_query:
@@ -357,11 +400,11 @@ class LLMRedisCache:
 if __name__ == "__main__":
     # Example usage with Groq API
     cache = LLMRedisCache(
-        redis_host = 'redis-14799.c80.us-east-1-2.ec2.redns.redis-cloud.com', 
-        redis_port = 14799, 
+        redis_host = '', 
+        redis_port = , 
         redis_db = 0,
         redis_username ="default",
-        redis_password ="ErYgSwTcwPEGElAkEyHvzSjCjg7CLjc1",
+        redis_password ="",
         # If GROQ_API_KEY is set in environment, this is optional
         groq_api_key=os.environ.get("GROQ_API_KEY"),
         embedding_model="all-MiniLM-L6-v2",
